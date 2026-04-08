@@ -1,29 +1,29 @@
 // ── Data Layer ──
-const STORAGE_KEY = 'trackTimerData';
+const API_BASE = 'http://100.88.32.101:3456';
 
 const DEFAULT_DATA = {
   runners: ['Hanner', 'Billie'],
-  events: ['800m', '400m', '300m Hurdles', '100m Hurdles', '4x400m Relay', '4x800m Relay'],
+  events: ['1600m', '800m', '400m', '300m Hurdles', '100m Hurdles', '4x800m Relay', '4x400m Relay', '4x200m Relay'],
   races: []
 };
 
-function loadData() {
+async function loadData() {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) {
-      const d = JSON.parse(raw);
-      // Merge defaults for any missing keys
-      return { ...DEFAULT_DATA, ...d };
-    }
-  } catch (e) { /* ignore parse errors */ }
+    const res = await fetch(API_BASE + '/api/data');
+    if (res.ok) return await res.json();
+  } catch (e) { /* server unreachable, use defaults */ }
   return { ...DEFAULT_DATA };
 }
 
-function saveData(data) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+function saveData(d) {
+  fetch(API_BASE + '/api/data', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(d)
+  }).catch(() => {});
 }
 
-let data = loadData();
+let data = { ...DEFAULT_DATA };
 
 // ── Timer State ──
 let timerState = 'idle'; // idle | running | stopped
@@ -129,9 +129,13 @@ function doStop() {
 
   btnRow.innerHTML = `
     <button class="btn btn-save" id="btnSave">Save</button>
+    <button class="btn btn-share" id="btnShare">Share</button>
     <button class="btn btn-reset" id="btnReset">Reset</button>
   `;
   document.getElementById('btnSave').addEventListener('click', doSave);
+  document.getElementById('btnShare').addEventListener('click', () => {
+    shareResult(runnerSelect.value, eventSelect.value, elapsed, laps);
+  });
   document.getElementById('btnReset').addEventListener('click', doReset);
 }
 
@@ -174,7 +178,11 @@ function populateSelects() {
   runnerSelect.innerHTML = data.runners.map(r => `<option value="${r}">${r}</option>`).join('');
   eventSelect.innerHTML = data.events.map(e => `<option value="${e}">${e}</option>`).join('');
 }
-populateSelects();
+// ── Init: load shared data from server ──
+loadData().then(d => {
+  data = d;
+  populateSelects();
+});
 
 // ── Tab Navigation ──
 const tabs = document.querySelectorAll('.tab-bar button');
@@ -187,8 +195,12 @@ tabs.forEach(tab => {
     tab.classList.add('active');
     document.getElementById(tab.dataset.tab + 'View').classList.add('active');
 
-    if (tab.dataset.tab === 'history') renderHistory();
-    if (tab.dataset.tab === 'settings') renderSettings();
+    if (tab.dataset.tab === 'history') {
+      loadData().then(d => { data = d; renderHistory(); });
+    }
+    if (tab.dataset.tab === 'settings') {
+      loadData().then(d => { data = d; populateSelects(); renderSettings(); });
+    }
   });
 });
 
@@ -232,6 +244,7 @@ function renderHistory() {
           <span class="runner-name ${runnerClass}">${race.runner}</span>
           <span>
             <span class="race-date">${dateStr}</span>
+            <button class="share-btn" data-id="${race.id}" title="Share">&#9993;</button>
             <button class="delete-btn" data-id="${race.id}" title="Delete">&times;</button>
           </span>
         </div>
@@ -241,6 +254,14 @@ function renderHistory() {
       </div>
     `;
   }).join('');
+
+  // Share handlers
+  raceList.querySelectorAll('.share-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const race = data.races.find(r => r.id === btn.dataset.id);
+      if (race) shareResult(race.runner, race.event, race.totalMs, race.laps);
+    });
+  });
 
   // Delete handlers
   raceList.querySelectorAll('.delete-btn').forEach(btn => {
@@ -335,6 +356,25 @@ document.getElementById('exportBtn').addEventListener('click', () => {
   a.click();
   URL.revokeObjectURL(url);
 });
+
+// ── Share Logic ──
+function buildShareText(runner, event, totalMs, lapsArr) {
+  let text = `${runner} - ${event}\nTime: ${formatTime(totalMs)}`;
+  if (lapsArr && lapsArr.length > 0) {
+    const splits = lapsArr.map((l, i) => `L${i + 1} ${formatTime(l.splitMs)}`).join(' | ');
+    text += `\nSplits: ${splits}`;
+  }
+  return text;
+}
+
+function shareResult(runner, event, totalMs, lapsArr) {
+  const text = buildShareText(runner, event, totalMs, lapsArr);
+  if (navigator.share) {
+    navigator.share({ text }).catch(() => {});
+  } else {
+    window.location.href = 'sms:?body=' + encodeURIComponent(text);
+  }
+}
 
 // ── Keep screen awake during timing ──
 let wakeLock = null;
