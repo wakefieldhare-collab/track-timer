@@ -1,5 +1,5 @@
 // ── Data Layer ──
-const API_BASE = 'http://100.88.32.101:3456';
+const API_BASE = 'https://gtf-desktop.tail98708b.ts.net:3456';
 
 const DEFAULT_DATA = {
   runners: ['Hanner', 'Billie'],
@@ -7,15 +7,27 @@ const DEFAULT_DATA = {
   races: []
 };
 
+const CACHE_KEY = 'trackTimerCache';
+
 async function loadData() {
   try {
     const res = await fetch(API_BASE + '/api/data');
-    if (res.ok) return await res.json();
-  } catch (e) { /* server unreachable, use defaults */ }
+    if (res.ok) {
+      const d = await res.json();
+      localStorage.setItem(CACHE_KEY, JSON.stringify(d));
+      return d;
+    }
+  } catch (e) { /* server unreachable */ }
+  // Fall back to cached data, then defaults
+  try {
+    const cached = localStorage.getItem(CACHE_KEY);
+    if (cached) return JSON.parse(cached);
+  } catch (e) { /* ignore */ }
   return { ...DEFAULT_DATA };
 }
 
 function saveData(d) {
+  localStorage.setItem(CACHE_KEY, JSON.stringify(d));
   fetch(API_BASE + '/api/data', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

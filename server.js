@@ -36,7 +36,9 @@ app.use(express.json());
 
 // CORS: allow GitHub Pages to call the API
 app.use('/api', (req, res, next) => {
-  res.header('Access-Control-Allow-Origin', 'https://wakefieldhare-collab.github.io');
+  const allowed = ['https://wakefieldhare-collab.github.io', 'https://gtf-desktop.tail98708b.ts.net:3456'];
+  const origin = req.headers.origin;
+  if (allowed.includes(origin)) res.header('Access-Control-Allow-Origin', origin);
   res.header('Access-Control-Allow-Methods', 'GET, PUT');
   res.header('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
