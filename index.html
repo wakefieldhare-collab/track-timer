@@ -21,6 +21,15 @@
     /* ── App Shell ── */
     .app { display: flex; flex-direction: column; height: 100dvh; }
 
+    /* ── Connection Status ── */
+    .conn-dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block; margin-right: 6px; vertical-align: middle;
+    }
+    .conn-dot.connected { background: #4ecca3; }
+    .conn-dot.disconnected { background: #e94560; animation: pulse-red 2s infinite; }
+    @keyframes pulse-red { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+
     /* ── Tab Bar ── */
     .tab-bar {
       display: flex;
@@ -286,12 +295,41 @@
       cursor: pointer;
       width: 100%;
     }
+
+    /* ── Recovery ── */
+    .recovery-alert {
+      background: #3d1a00;
+      border: 1px solid #e9a045;
+      border-radius: 8px;
+      padding: 10px;
+      font-size: 13px;
+      color: #e9a045;
+      margin-bottom: 8px;
+    }
+    .recovery-info {
+      font-size: 12px;
+      color: #7a8ba6;
+      margin-bottom: 8px;
+    }
+    .recover-btn {
+      display: block;
+      margin-top: 8px;
+      padding: 8px 16px;
+      background: #e9a045;
+      color: #1a1a2e;
+      border: none;
+      border-radius: 8px;
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      width: 100%;
+    }
   </style>
 </head>
 <body>
   <div class="app">
     <div class="tab-bar">
-      <button class="active" data-tab="timer">Timer</button>
+      <button class="active" data-tab="timer"><span id="connStatus" class="conn-dot disconnected"></span>Timer</button>
       <button data-tab="history">History</button>
       <button data-tab="settings">Settings</button>
     </div>
@@ -343,6 +381,7 @@
       </div>
       <div class="setting-section">
         <h3>Data</h3>
+        <div id="recoveryStatus"></div>
         <button class="export-btn" id="exportBtn">Export All Data (JSON)</button>
       </div>
     </div>

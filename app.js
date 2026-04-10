@@ -8,34 +8,104 @@ const DEFAULT_DATA = {
 };
 
 const CACHE_KEY = 'trackTimerCache';
+let serverConnected = false;
+let dataLoadedFromServer = false;
+
+// ── Connection Status ──
+function updateConnectionStatus(connected) {
+  serverConnected = connected;
+  const dot = document.getElementById('connStatus');
+  if (dot) {
+    dot.className = 'conn-dot ' + (connected ? 'connected' : 'disconnected');
+    dot.title = connected ? 'Server connected' : 'Offline -- data saved locally only';
+  }
+}
+
+async function checkConnection() {
+  try {
+    const res = await fetch(API_BASE + '/api/data', { method: 'HEAD', signal: AbortSignal.timeout(3000) });
+    updateConnectionStatus(res.ok);
+  } catch {
+    updateConnectionStatus(false);
+  }
+}
+
+// Poll connection every 30s
+setInterval(checkConnection, 30000);
 
 async function loadData() {
   try {
-    const res = await fetch(API_BASE + '/api/data');
+    const res = await fetch(API_BASE + '/api/data', { signal: AbortSignal.timeout(5000) });
     if (res.ok) {
       const d = await res.json();
+      updateConnectionStatus(true);
+      dataLoadedFromServer = true;
+
+      // Merge with local cache: keep whichever has more races, merge any unique ones
+      const cached = getLocalCache();
+      if (cached && cached.races && cached.races.length > 0) {
+        const serverIds = new Set(d.races.map(r => r.id));
+        const localOnly = cached.races.filter(r => !serverIds.has(r.id));
+        if (localOnly.length > 0) {
+          d.races = [...localOnly, ...d.races];
+          d.races.sort((a, b) => new Date(b.date) - new Date(a.date));
+          // Push merged data back to server
+          fetch(API_BASE + '/api/data', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(d)
+          }).catch(() => {});
+        }
+      }
+
       localStorage.setItem(CACHE_KEY, JSON.stringify(d));
       return d;
     }
   } catch (e) { /* server unreachable */ }
-  // Fall back to cached data, then defaults
+
+  updateConnectionStatus(false);
+
+  // Fall back to cached data -- NEVER fall back to empty defaults
+  const cached = getLocalCache();
+  if (cached) {
+    dataLoadedFromServer = false;
+    return cached;
+  }
+
+  // Last resort: defaults, but flag that we have no real data
+  dataLoadedFromServer = false;
+  return { ...DEFAULT_DATA, races: [] };
+}
+
+function getLocalCache() {
   try {
-    const cached = localStorage.getItem(CACHE_KEY);
-    if (cached) return JSON.parse(cached);
+    const raw = localStorage.getItem(CACHE_KEY);
+    if (raw) return JSON.parse(raw);
   } catch (e) { /* ignore */ }
-  return { ...DEFAULT_DATA };
+  return null;
 }
 
 function saveData(d) {
+  // Always save to localStorage immediately
   localStorage.setItem(CACHE_KEY, JSON.stringify(d));
+
+  // Save to server
   fetch(API_BASE + '/api/data', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(d)
-  }).catch(() => {});
+  }).then(res => {
+    if (res.ok) {
+      updateConnectionStatus(true);
+      return res.json();
+    }
+    throw new Error('Server save failed');
+  }).catch(() => {
+    updateConnectionStatus(false);
+  });
 }
 
-let data = { ...DEFAULT_DATA };
+let data = { ...DEFAULT_DATA, races: [] };
 
 // ── Timer State ──
 let timerState = 'idle'; // idle | running | stopped
@@ -330,6 +400,49 @@ function renderSettings() {
       renderSettings();
     });
   });
+
+  // Recovery status
+  updateRecoveryStatus();
+}
+
+// ── Recovery ──
+function updateRecoveryStatus() {
+  const el = document.getElementById('recoveryStatus');
+  if (!el) return;
+  const cached = getLocalCache();
+  const localRaces = cached ? (cached.races || []).length : 0;
+  const serverRaces = data.races.length;
+
+  if (localRaces > 0 && localRaces > serverRaces) {
+    el.innerHTML = `<div class="recovery-alert">Found ${localRaces} races in local cache (server has ${serverRaces}). <button id="recoverLocalBtn" class="recover-btn">Recover Local Data</button></div>`;
+    document.getElementById('recoverLocalBtn').addEventListener('click', recoverFromLocal);
+  } else {
+    el.innerHTML = `<div class="recovery-info">${serverRaces} races on server, ${localRaces} in local cache.</div>`;
+  }
+}
+
+async function recoverFromLocal() {
+  const cached = getLocalCache();
+  if (!cached || !cached.races || cached.races.length === 0) {
+    alert('No local data to recover.');
+    return;
+  }
+  try {
+    const res = await fetch(API_BASE + '/api/recover', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ races: cached.races })
+    });
+    if (res.ok) {
+      const result = await res.json();
+      alert(`Recovered ${result.recovered} races! Total: ${result.raceCount}`);
+      loadData().then(d => { data = d; renderSettings(); });
+    } else {
+      alert('Recovery failed. Server may be unreachable.');
+    }
+  } catch {
+    alert('Could not reach server for recovery.');
+  }
 }
 
 // Add runner
@@ -404,11 +517,6 @@ function releaseWakeLock() {
   }
 }
 
-// Hook wake lock into start/stop
-const origStart = doStart;
-const origStop = doStop;
-const origReset = doReset;
-
 // Re-acquire wake lock if page becomes visible again
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && timerState === 'running') {
@@ -416,17 +524,8 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-// Patch start to also request wake lock
-const _origStartClick = document.getElementById('btnStart');
-// Wake lock is handled via the doStart override below
-
-// We need to patch at the function level
+// Wake lock via delegated click handler
 (function patchWakeLock() {
-  const realDoStart = doStart;
-  // Can't reassign const, so we hook via the event listener pattern already in place
-  // The wake lock request is made inside the tick loop check
-  // Simplest: just call requestWakeLock when timer starts
-  // We'll add it to the start button handler chain
   document.addEventListener('click', (e) => {
     if (e.target.id === 'btnStart' || e.target.textContent === 'Start') {
       requestWakeLock();
