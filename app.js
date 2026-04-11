@@ -1,8 +1,4 @@
 // ── Event Configuration ──
-// Maps event names to their expected structure.
-// laps: number of splits for individual events
-// legs: number of splits for relay events
-// null laps/legs = manual stop (unknown event)
 const EVENT_CONFIG = {
   '1600m':          { laps: 4, relay: false },
   '800m':           { laps: 2, relay: false },
@@ -34,6 +30,7 @@ const DEFAULT_DATA = {
 };
 
 const CACHE_KEY = 'trackTimerCache';
+const MEET_KEY = 'trackTimerMeet';
 let serverConnected = false;
 
 // ── Connection Status ──
@@ -64,7 +61,6 @@ async function loadData() {
       const d = await res.json();
       updateConnectionStatus(true);
 
-      // Merge with local cache
       const cached = getLocalCache();
       if (cached && cached.races && cached.races.length > 0) {
         const serverIds = new Set(d.races.map(r => r.id));
@@ -86,10 +82,8 @@ async function loadData() {
   } catch (e) { /* server unreachable */ }
 
   updateConnectionStatus(false);
-
   const cached = getLocalCache();
   if (cached) return cached;
-
   return { ...DEFAULT_DATA, races: [] };
 }
 
@@ -117,14 +111,51 @@ function saveData(d) {
 
 let data = { ...DEFAULT_DATA, races: [] };
 
+// ── PR Detection ──
+// Returns the current PR time for a runner+event combo, excluding a given race ID
+function getPR(runner, event, excludeId) {
+  const matching = data.races.filter(r =>
+    r.runner === runner && r.event === event && r.id !== excludeId
+  );
+  if (matching.length === 0) return null;
+  return Math.min(...matching.map(r => r.totalMs));
+}
+
+// Check if a time is a PR
+function isPR(race) {
+  const previousBest = getPR(race.runner, race.event, race.id);
+  if (previousBest === null) return true; // First time = PR
+  return race.totalMs < previousBest;
+}
+
+// Get PR diff string
+function getPRDiff(race) {
+  const previousBest = getPR(race.runner, race.event, race.id);
+  if (previousBest === null) return null; // First race, no comparison
+  const diff = race.totalMs - previousBest;
+  if (diff < 0) {
+    return { improved: true, text: '-' + formatTime(Math.abs(diff)) };
+  } else {
+    return { improved: false, text: '+' + formatTime(diff) };
+  }
+}
+
+function showPRToast() {
+  const toast = document.getElementById('prToast');
+  toast.classList.add('show');
+  // Haptic burst for PR
+  if (navigator.vibrate) navigator.vibrate([100, 50, 100, 50, 200]);
+  setTimeout(() => { toast.classList.remove('show'); }, 2000);
+}
+
 // ── Timer State ──
-let timerState = 'idle'; // idle | running | stopped
+let timerState = 'idle';
 let startTime = 0;
 let elapsed = 0;
-let laps = []; // { splitMs, elapsedMs }
+let laps = [];
 let lastLapTime = 0;
 let rafId = null;
-let lastTapTime = 0; // debounce
+let lastTapTime = 0;
 
 // ── DOM Refs ──
 const timerDisplay = document.getElementById('timerDisplay');
@@ -136,6 +167,14 @@ const eventSelect = document.getElementById('eventSelect');
 const legRow = document.getElementById('legRow');
 const legSelect = document.getElementById('legSelect');
 const progressIndicator = document.getElementById('progressIndicator');
+const meetInput = document.getElementById('meetInput');
+
+// ── Meet Name Persistence ──
+// Remember the last meet name so you don't re-type it between races
+meetInput.value = localStorage.getItem(MEET_KEY) || '';
+meetInput.addEventListener('input', () => {
+  localStorage.setItem(MEET_KEY, meetInput.value);
+});
 
 // ── Format Time ──
 function formatTime(ms) {
@@ -219,7 +258,6 @@ function updateMainButton() {
   const expected = getExpectedSplits(eventSelect.value);
   const unit = cfg.relay ? 'LEG' : 'LAP';
 
-  // Remove all state classes
   mainBtn.classList.remove('state-start', 'state-lap', 'state-finish', 'state-save', 'state-split');
 
   if (timerState === 'idle') {
@@ -227,7 +265,6 @@ function updateMainButton() {
     mainBtn.classList.add('state-start');
   } else if (timerState === 'running') {
     if (expected === null) {
-      // Unknown event: manual stop
       mainBtn.textContent = 'SPLIT';
       mainBtn.classList.add('state-split');
     } else {
@@ -265,22 +302,27 @@ function updateAuxButtons() {
   }
 }
 
+// ── Haptic Feedback ──
+function hapticTap() {
+  if (navigator.vibrate) navigator.vibrate(40);
+}
+
 // ── Main Button Handler ──
 function doMainButton() {
-  // Debounce: ignore taps within 400ms
   const now = Date.now();
   if (now - lastTapTime < 400) return;
   lastTapTime = now;
 
   if (timerState === 'idle') {
+    hapticTap();
     doStart();
   } else if (timerState === 'running') {
+    hapticTap();
     doLap();
     const expected = getExpectedSplits(eventSelect.value);
     if (expected !== null && laps.length >= expected) {
       doStop();
     } else {
-      // Flash feedback
       mainBtn.style.opacity = '0.6';
       setTimeout(() => { mainBtn.style.opacity = '1'; }, 100);
       updateMainButton();
@@ -308,6 +350,7 @@ function doStart() {
   runnerSelect.disabled = true;
   eventSelect.disabled = true;
   legSelect.disabled = true;
+  meetInput.disabled = true;
 
   updateMainButton();
   updateAuxButtons();
@@ -333,7 +376,6 @@ function doStop() {
   timerDisplay.classList.remove('running');
   timerDisplay.classList.add('stopped');
 
-  // Add final split if there are laps and the last lap doesn't match total
   if (laps.length > 0) {
     const lastElapsed = laps[laps.length - 1].elapsedMs;
     if (elapsed - lastElapsed > 50) {
@@ -341,7 +383,6 @@ function doStop() {
       renderLaps();
     }
   } else {
-    // No laps recorded (single split, e.g. 400m): record the total as the only split
     laps.push({ splitMs: elapsed, elapsedMs: elapsed });
     renderLaps();
   }
@@ -354,6 +395,8 @@ function doStop() {
 
 function doSave() {
   const cfg = getEventConfig(eventSelect.value);
+  const meetName = meetInput.value.trim() || null;
+
   const race = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     runner: runnerSelect.value,
@@ -361,10 +404,20 @@ function doSave() {
     date: new Date().toISOString(),
     totalMs: elapsed,
     relayLeg: cfg.relay ? parseInt(legSelect.value) : null,
+    meet: meetName,
     laps: laps.map(l => ({ splitMs: Math.round(l.splitMs), elapsedMs: Math.round(l.elapsedMs) }))
   };
+
+  // Check PR before adding (so it compares against existing races only)
+  const isNewPR = isPR(race);
+
   data.races.unshift(race);
   saveData(data);
+
+  if (isNewPR) {
+    showPRToast();
+  }
+
   doReset();
 }
 
@@ -379,6 +432,7 @@ function doReset() {
   runnerSelect.disabled = false;
   eventSelect.disabled = false;
   legSelect.disabled = false;
+  meetInput.disabled = false;
 
   updateMainButton();
   updateAuxButtons();
@@ -439,6 +493,7 @@ tabs.forEach(tab => {
 // ── History View ──
 const filterRunner = document.getElementById('filterRunner');
 const filterEvent = document.getElementById('filterEvent');
+const filterMeet = document.getElementById('filterMeet');
 const raceList = document.getElementById('raceList');
 
 function populateFilters() {
@@ -446,61 +501,60 @@ function populateFilters() {
     data.runners.map(r => `<option value="${r}">${r}</option>`).join('');
   filterEvent.innerHTML = '<option value="all">All Events</option>' +
     data.events.map(e => `<option value="${e}">${e}</option>`).join('');
+
+  // Populate meet filter from actual race data
+  const meets = [...new Set(data.races.map(r => r.meet).filter(Boolean))];
+  filterMeet.innerHTML = '<option value="all">All Meets</option>' +
+    meets.map(m => `<option value="${m}">${m}</option>`).join('');
 }
 
 function renderHistory() {
   populateFilters();
   const fr = filterRunner.value;
   const fe = filterEvent.value;
+  const fm = filterMeet.value;
 
   let races = data.races;
   if (fr !== 'all') races = races.filter(r => r.runner === fr);
   if (fe !== 'all') races = races.filter(r => r.event === fe);
+  if (fm !== 'all') races = races.filter(r => r.meet === fm);
 
   if (races.length === 0) {
     raceList.innerHTML = '<div class="empty-state">No races recorded yet.<br>Start timing!</div>';
     return;
   }
 
-  raceList.innerHTML = races.map(race => {
-    const d = new Date(race.date);
-    const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
-    const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
-    const runnerClass = race.runner.toLowerCase();
-    const cfg = getEventConfig(race.event);
+  // Group races by meet (or by date if no meet)
+  const groups = [];
+  let currentGroup = null;
 
-    // Relay leg label
-    const relayLegHtml = race.relayLeg
-      ? `<div class="relay-leg-label">${race.runner} ran Leg ${race.relayLeg}</div>`
-      : '';
+  for (const race of races) {
+    const meetKey = race.meet || null;
+    const dateKey = new Date(race.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const groupKey = meetKey || dateKey;
 
-    // Splits with relay leg highlight
-    const splitsHtml = race.laps.length > 0
-      ? `<div class="splits">${race.laps.map((l, i) => {
-          const label = cfg.relay ? `Leg ${i + 1}` : `L${i + 1}`;
-          const isRunnerLeg = race.relayLeg && (i + 1) === race.relayLeg;
-          const chipClass = isRunnerLeg ? 'split-chip runner-leg' : 'split-chip';
-          return `<span class="${chipClass}">${label}: ${formatTime(l.splitMs)}</span>`;
-        }).join('')}</div>`
-      : '';
+    if (!currentGroup || currentGroup.key !== groupKey) {
+      currentGroup = { key: groupKey, meet: meetKey, date: dateKey, races: [] };
+      groups.push(currentGroup);
+    }
+    currentGroup.races.push(race);
+  }
 
-    return `
-      <div class="race-card">
-        <div class="race-card-header">
-          <span class="runner-name ${runnerClass}">${race.runner}</span>
-          <span>
-            <span class="race-date">${dateStr} ${timeStr}</span>
-            <button class="share-btn" data-id="${race.id}" title="Share">&#9993;</button>
-            <button class="delete-btn" data-id="${race.id}" title="Delete">&times;</button>
-          </span>
-        </div>
-        <div class="event-name">${race.event}</div>
-        ${relayLegHtml}
-        <div class="total-time">${formatTime(race.totalMs)}</div>
-        ${splitsHtml}
-      </div>
-    `;
-  }).join('');
+  let html = '';
+  for (const group of groups) {
+    // Meet header
+    if (group.meet) {
+      html += `<div class="meet-header">${group.meet}<span class="meet-date">${group.date}</span></div>`;
+    } else {
+      html += `<div class="meet-header">${group.date}</div>`;
+    }
+
+    for (const race of group.races) {
+      html += renderRaceCard(race);
+    }
+  }
+
+  raceList.innerHTML = html;
 
   // Share handlers
   raceList.querySelectorAll('.share-btn').forEach(btn => {
@@ -522,8 +576,57 @@ function renderHistory() {
   });
 }
 
+function renderRaceCard(race) {
+  const d = new Date(race.date);
+  const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
+  const runnerClass = race.runner.toLowerCase();
+  const cfg = getEventConfig(race.event);
+
+  // PR detection
+  const prFlag = isPR(race);
+  const prDiff = getPRDiff(race);
+  const prBadgeHtml = prFlag ? '<span class="pr-badge">PR</span>' : '';
+  const prDiffHtml = prDiff
+    ? `<span class="pr-diff ${prDiff.improved ? 'improved' : ''}">${prDiff.text}</span>`
+    : '';
+  const prCardClass = prFlag ? 'race-card is-pr' : 'race-card';
+
+  // Relay leg label
+  const relayLegHtml = race.relayLeg
+    ? `<div class="relay-leg-label">${race.runner} ran Leg ${race.relayLeg}</div>`
+    : '';
+
+  // Splits with relay leg highlight
+  const splitsHtml = race.laps.length > 0
+    ? `<div class="splits">${race.laps.map((l, i) => {
+        const label = cfg.relay ? `Leg ${i + 1}` : `L${i + 1}`;
+        const isRunnerLeg = race.relayLeg && (i + 1) === race.relayLeg;
+        const chipClass = isRunnerLeg ? 'split-chip runner-leg' : 'split-chip';
+        return `<span class="${chipClass}">${label}: ${formatTime(l.splitMs)}</span>`;
+      }).join('')}</div>`
+    : '';
+
+  return `
+    <div class="${prCardClass}">
+      <div class="race-card-header">
+        <span class="runner-name ${runnerClass}">${race.runner}${prBadgeHtml}</span>
+        <span>
+          <span class="race-date">${timeStr}</span>
+          <button class="share-btn" data-id="${race.id}" title="Share">&#9993;</button>
+          <button class="delete-btn" data-id="${race.id}" title="Delete">&times;</button>
+        </span>
+      </div>
+      <div class="event-name">${race.event}</div>
+      ${relayLegHtml}
+      <div class="total-time">${formatTime(race.totalMs)}${prDiffHtml}</div>
+      ${splitsHtml}
+    </div>
+  `;
+}
+
 filterRunner.addEventListener('change', renderHistory);
 filterEvent.addEventListener('change', renderHistory);
+filterMeet.addEventListener('change', renderHistory);
 
 // ── Settings View ──
 function renderSettings() {

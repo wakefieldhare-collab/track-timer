@@ -206,6 +206,67 @@
       border-radius: 10px;
       padding: 10px 12px;
       margin-bottom: 8px;
+      position: relative;
+    }
+    .race-card.is-pr { border-left: 3px solid #ffd700; }
+
+    /* ── Meet Headers ── */
+    .meet-header {
+      font-size: 15px;
+      font-weight: 700;
+      color: #eee;
+      padding: 10px 0 4px;
+      border-bottom: 1px solid #0f3460;
+      margin-bottom: 8px;
+    }
+    .meet-header .meet-date {
+      font-size: 12px;
+      color: #7a8ba6;
+      font-weight: 400;
+      margin-left: 8px;
+    }
+
+    /* ── PR Badge ── */
+    .pr-badge {
+      display: inline-block;
+      background: #ffd700;
+      color: #1a1a2e;
+      font-size: 10px;
+      font-weight: 800;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-left: 6px;
+      letter-spacing: 0.5px;
+      vertical-align: middle;
+    }
+    .pr-diff {
+      font-size: 11px;
+      color: #7a8ba6;
+      margin-left: 6px;
+    }
+    .pr-diff.improved { color: #4ecca3; }
+
+    /* ── PR Toast ── */
+    .pr-toast {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%) scale(0.8);
+      background: #ffd700;
+      color: #1a1a2e;
+      padding: 20px 40px;
+      border-radius: 16px;
+      font-size: 28px;
+      font-weight: 800;
+      letter-spacing: 2px;
+      z-index: 1000;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s, transform 0.3s;
+    }
+    .pr-toast.show {
+      opacity: 1;
+      transform: translate(-50%, -50%) scale(1);
     }
     .race-card-header {
       display: flex;
@@ -386,8 +447,14 @@
       <button data-tab="settings">Settings</button>
     </div>
 
+    <!-- PR Toast -->
+    <div class="pr-toast" id="prToast">NEW PR!</div>
+
     <!-- ── Timer View ── -->
     <div class="view timer-view active" id="timerView">
+      <div class="setup-row" id="meetRow">
+        <input type="text" id="meetInput" placeholder="Meet name (optional)" style="flex:1; padding:8px 10px; border-radius:8px; border:1px solid #0f3460; background:#16213e; color:#eee; font-size:14px;">
+      </div>
       <div class="setup-row" id="setupRow">
         <select id="runnerSelect"></select>
         <select id="eventSelect"></select>
@@ -412,6 +479,9 @@
         </select>
         <select id="filterEvent">
           <option value="all">All Events</option>
+        </select>
+        <select id="filterMeet">
+          <option value="all">All Meets</option>
         </select>
       </div>
       <div class="race-list" id="raceList"></div>
