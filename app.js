@@ -1,3 +1,29 @@
+// ── Event Configuration ──
+// Maps event names to their expected structure.
+// laps: number of splits for individual events
+// legs: number of splits for relay events
+// null laps/legs = manual stop (unknown event)
+const EVENT_CONFIG = {
+  '1600m':          { laps: 4, relay: false },
+  '800m':           { laps: 2, relay: false },
+  '400m':           { laps: 1, relay: false },
+  '300m Hurdles':   { laps: 1, relay: false },
+  '100m Hurdles':   { laps: 1, relay: false },
+  '4x800m Relay':   { legs: 4, relay: true },
+  '4x400m Relay':   { legs: 4, relay: true },
+  '4x200m Relay':   { legs: 4, relay: true },
+};
+
+function getEventConfig(eventName) {
+  return EVENT_CONFIG[eventName] || { laps: null, relay: false };
+}
+
+function getExpectedSplits(eventName) {
+  const cfg = getEventConfig(eventName);
+  if (cfg.relay) return cfg.legs || null;
+  return cfg.laps || null;
+}
+
 // ── Data Layer ──
 const API_BASE = 'https://gtf-desktop.tail98708b.ts.net:3456';
 
@@ -9,7 +35,6 @@ const DEFAULT_DATA = {
 
 const CACHE_KEY = 'trackTimerCache';
 let serverConnected = false;
-let dataLoadedFromServer = false;
 
 // ── Connection Status ──
 function updateConnectionStatus(connected) {
@@ -30,7 +55,6 @@ async function checkConnection() {
   }
 }
 
-// Poll connection every 30s
 setInterval(checkConnection, 30000);
 
 async function loadData() {
@@ -39,9 +63,8 @@ async function loadData() {
     if (res.ok) {
       const d = await res.json();
       updateConnectionStatus(true);
-      dataLoadedFromServer = true;
 
-      // Merge with local cache: keep whichever has more races, merge any unique ones
+      // Merge with local cache
       const cached = getLocalCache();
       if (cached && cached.races && cached.races.length > 0) {
         const serverIds = new Set(d.races.map(r => r.id));
@@ -49,7 +72,6 @@ async function loadData() {
         if (localOnly.length > 0) {
           d.races = [...localOnly, ...d.races];
           d.races.sort((a, b) => new Date(b.date) - new Date(a.date));
-          // Push merged data back to server
           fetch(API_BASE + '/api/data', {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
@@ -65,15 +87,9 @@ async function loadData() {
 
   updateConnectionStatus(false);
 
-  // Fall back to cached data -- NEVER fall back to empty defaults
   const cached = getLocalCache();
-  if (cached) {
-    dataLoadedFromServer = false;
-    return cached;
-  }
+  if (cached) return cached;
 
-  // Last resort: defaults, but flag that we have no real data
-  dataLoadedFromServer = false;
   return { ...DEFAULT_DATA, races: [] };
 }
 
@@ -86,19 +102,13 @@ function getLocalCache() {
 }
 
 function saveData(d) {
-  // Always save to localStorage immediately
   localStorage.setItem(CACHE_KEY, JSON.stringify(d));
-
-  // Save to server
   fetch(API_BASE + '/api/data', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(d)
   }).then(res => {
-    if (res.ok) {
-      updateConnectionStatus(true);
-      return res.json();
-    }
+    if (res.ok) { updateConnectionStatus(true); return res.json(); }
     throw new Error('Server save failed');
   }).catch(() => {
     updateConnectionStatus(false);
@@ -114,15 +124,18 @@ let elapsed = 0;
 let laps = []; // { splitMs, elapsedMs }
 let lastLapTime = 0;
 let rafId = null;
+let lastTapTime = 0; // debounce
 
 // ── DOM Refs ──
 const timerDisplay = document.getElementById('timerDisplay');
-const btnStart = document.getElementById('btnStart');
-const btnLap = document.getElementById('btnLap');
-const btnRow = document.getElementById('btnRow');
+const mainBtn = document.getElementById('mainBtn');
+const auxBtns = document.getElementById('auxBtns');
 const lapList = document.getElementById('lapList');
 const runnerSelect = document.getElementById('runnerSelect');
 const eventSelect = document.getElementById('eventSelect');
+const legRow = document.getElementById('legRow');
+const legSelect = document.getElementById('legSelect');
+const progressIndicator = document.getElementById('progressIndicator');
 
 // ── Format Time ──
 function formatTime(ms) {
@@ -141,18 +154,146 @@ function tick() {
   rafId = requestAnimationFrame(tick);
 }
 
-// ── Render Laps ──
-function renderLaps() {
-  lapList.innerHTML = laps.map((lap, i) => `
-    <div class="lap-item">
-      <span class="lap-label">Lap ${i + 1}</span>
-      <span class="lap-split">${formatTime(lap.splitMs)}</span>
-      <span class="lap-elapsed">${formatTime(lap.elapsedMs)}</span>
-    </div>
-  `).reverse().join('');
+// ── Split Label ──
+function getSplitLabel(index) {
+  const cfg = getEventConfig(eventSelect.value);
+  if (cfg.relay) return `Leg ${index + 1}`;
+  return `Lap ${index + 1}`;
 }
 
-// ── Button Actions ──
+// ── Render Laps ──
+function renderLaps() {
+  const cfg = getEventConfig(eventSelect.value);
+  const runnerLeg = cfg.relay ? parseInt(legSelect.value) : null;
+
+  lapList.innerHTML = laps.map((lap, i) => {
+    const label = getSplitLabel(i);
+    const isRunnerLeg = runnerLeg && (i + 1) === runnerLeg;
+    const labelClass = isRunnerLeg ? 'lap-label runner-leg' : 'lap-label';
+    return `
+      <div class="lap-item">
+        <span class="${labelClass}">${label}</span>
+        <span class="lap-split">${formatTime(lap.splitMs)}</span>
+        <span class="lap-elapsed">${formatTime(lap.elapsedMs)}</span>
+      </div>
+    `;
+  }).reverse().join('');
+}
+
+// ── Progress Indicator ──
+function updateProgress() {
+  const expected = getExpectedSplits(eventSelect.value);
+  const cfg = getEventConfig(eventSelect.value);
+  const unit = cfg.relay ? 'Leg' : 'Lap';
+
+  if (timerState === 'idle') {
+    if (expected) {
+      progressIndicator.textContent = `${expected} ${unit.toLowerCase()}s`;
+    } else {
+      progressIndicator.textContent = '';
+    }
+    return;
+  }
+
+  if (timerState === 'running') {
+    if (expected) {
+      progressIndicator.textContent = `${unit} ${laps.length} of ${expected}`;
+    } else {
+      progressIndicator.textContent = laps.length > 0 ? `${laps.length} splits` : '';
+    }
+    return;
+  }
+
+  if (timerState === 'stopped') {
+    if (expected) {
+      progressIndicator.textContent = `${expected} ${unit.toLowerCase()}s complete`;
+    } else {
+      progressIndicator.textContent = `${laps.length} splits`;
+    }
+  }
+}
+
+// ── Main Button Label & Style ──
+function updateMainButton() {
+  const cfg = getEventConfig(eventSelect.value);
+  const expected = getExpectedSplits(eventSelect.value);
+  const unit = cfg.relay ? 'LEG' : 'LAP';
+
+  // Remove all state classes
+  mainBtn.classList.remove('state-start', 'state-lap', 'state-finish', 'state-save', 'state-split');
+
+  if (timerState === 'idle') {
+    mainBtn.textContent = 'START';
+    mainBtn.classList.add('state-start');
+  } else if (timerState === 'running') {
+    if (expected === null) {
+      // Unknown event: manual stop
+      mainBtn.textContent = 'SPLIT';
+      mainBtn.classList.add('state-split');
+    } else {
+      const nextSplit = laps.length + 1;
+      if (nextSplit >= expected) {
+        mainBtn.textContent = 'FINISH';
+        mainBtn.classList.add('state-finish');
+      } else {
+        mainBtn.textContent = `${unit} ${nextSplit}`;
+        mainBtn.classList.add('state-lap');
+      }
+    }
+  } else if (timerState === 'stopped') {
+    mainBtn.textContent = 'SAVE';
+    mainBtn.classList.add('state-save');
+  }
+}
+
+// ── Aux Buttons ──
+function updateAuxButtons() {
+  if (timerState === 'idle') {
+    auxBtns.innerHTML = '';
+  } else if (timerState === 'running') {
+    auxBtns.innerHTML = `<button class="aux-btn aux-btn-stop" id="auxStop">Stop</button>`;
+    document.getElementById('auxStop').addEventListener('click', doStop);
+  } else if (timerState === 'stopped') {
+    auxBtns.innerHTML = `
+      <button class="aux-btn aux-btn-share" id="auxShare">Share</button>
+      <button class="aux-btn aux-btn-reset" id="auxReset">Reset</button>
+    `;
+    document.getElementById('auxShare').addEventListener('click', () => {
+      shareResult(runnerSelect.value, eventSelect.value, elapsed, laps);
+    });
+    document.getElementById('auxReset').addEventListener('click', doReset);
+  }
+}
+
+// ── Main Button Handler ──
+function doMainButton() {
+  // Debounce: ignore taps within 400ms
+  const now = Date.now();
+  if (now - lastTapTime < 400) return;
+  lastTapTime = now;
+
+  if (timerState === 'idle') {
+    doStart();
+  } else if (timerState === 'running') {
+    doLap();
+    const expected = getExpectedSplits(eventSelect.value);
+    if (expected !== null && laps.length >= expected) {
+      doStop();
+    } else {
+      // Flash feedback
+      mainBtn.style.opacity = '0.6';
+      setTimeout(() => { mainBtn.style.opacity = '1'; }, 100);
+      updateMainButton();
+      updateProgress();
+    }
+  } else if (timerState === 'stopped') {
+    doSave();
+  }
+}
+
+mainBtn.addEventListener('click', doMainButton);
+
+// ── Timer Actions ──
 function doStart() {
   timerState = 'running';
   startTime = performance.now();
@@ -164,16 +305,14 @@ function doStart() {
   timerDisplay.classList.remove('stopped');
   tick();
 
-  btnRow.innerHTML = `
-    <button class="btn btn-stop" id="btnStop">Stop</button>
-    <button class="btn btn-lap" id="btnLap2">Lap</button>
-  `;
-  document.getElementById('btnStop').addEventListener('click', doStop);
-  document.getElementById('btnLap2').addEventListener('click', doLap);
-
-  // Disable setup controls
   runnerSelect.disabled = true;
   eventSelect.disabled = true;
+  legSelect.disabled = true;
+
+  updateMainButton();
+  updateAuxButtons();
+  updateProgress();
+  requestWakeLock();
 }
 
 function doLap() {
@@ -183,12 +322,6 @@ function doLap() {
   laps.push({ splitMs: split, elapsedMs: now });
   lastLapTime = now;
   renderLaps();
-  // Quick flash feedback
-  const lapBtn = document.getElementById('btnLap2');
-  if (lapBtn) {
-    lapBtn.style.background = '#4ecca3';
-    setTimeout(() => { lapBtn.style.background = '#0f3460'; }, 120);
-  }
 }
 
 function doStop() {
@@ -200,34 +333,34 @@ function doStop() {
   timerDisplay.classList.remove('running');
   timerDisplay.classList.add('stopped');
 
-  // Add final split if laps were taken and last lap != total
+  // Add final split if there are laps and the last lap doesn't match total
   if (laps.length > 0) {
     const lastElapsed = laps[laps.length - 1].elapsedMs;
     if (elapsed - lastElapsed > 50) {
       laps.push({ splitMs: elapsed - lastElapsed, elapsedMs: elapsed });
       renderLaps();
     }
+  } else {
+    // No laps recorded (single split, e.g. 400m): record the total as the only split
+    laps.push({ splitMs: elapsed, elapsedMs: elapsed });
+    renderLaps();
   }
 
-  btnRow.innerHTML = `
-    <button class="btn btn-save" id="btnSave">Save</button>
-    <button class="btn btn-share" id="btnShare">Share</button>
-    <button class="btn btn-reset" id="btnReset">Reset</button>
-  `;
-  document.getElementById('btnSave').addEventListener('click', doSave);
-  document.getElementById('btnShare').addEventListener('click', () => {
-    shareResult(runnerSelect.value, eventSelect.value, elapsed, laps);
-  });
-  document.getElementById('btnReset').addEventListener('click', doReset);
+  updateMainButton();
+  updateAuxButtons();
+  updateProgress();
+  releaseWakeLock();
 }
 
 function doSave() {
+  const cfg = getEventConfig(eventSelect.value);
   const race = {
     id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
     runner: runnerSelect.value,
     event: eventSelect.value,
     date: new Date().toISOString(),
     totalMs: elapsed,
+    relayLeg: cfg.relay ? parseInt(legSelect.value) : null,
     laps: laps.map(l => ({ splitMs: Math.round(l.splitMs), elapsedMs: Math.round(l.elapsedMs) }))
   };
   data.races.unshift(race);
@@ -245,25 +378,42 @@ function doReset() {
   timerDisplay.classList.remove('running', 'stopped');
   runnerSelect.disabled = false;
   eventSelect.disabled = false;
+  legSelect.disabled = false;
 
-  btnRow.innerHTML = `
-    <button class="btn btn-start" id="btnStart">Start</button>
-    <button class="btn btn-lap" id="btnLap" disabled>Lap</button>
-  `;
-  document.getElementById('btnStart').addEventListener('click', doStart);
+  updateMainButton();
+  updateAuxButtons();
+  updateProgress();
 }
 
-btnStart.addEventListener('click', doStart);
+// ── Relay Leg Selector ──
+function updateLegSelector() {
+  const cfg = getEventConfig(eventSelect.value);
+  if (cfg.relay) {
+    const legs = cfg.legs || 4;
+    legSelect.innerHTML = Array.from({ length: legs }, (_, i) =>
+      `<option value="${i + 1}">Leg ${i + 1}</option>`
+    ).join('');
+    legRow.style.display = 'flex';
+  } else {
+    legRow.style.display = 'none';
+  }
+  updateProgress();
+}
+
+eventSelect.addEventListener('change', updateLegSelector);
 
 // ── Populate Selects ──
 function populateSelects() {
   runnerSelect.innerHTML = data.runners.map(r => `<option value="${r}">${r}</option>`).join('');
   eventSelect.innerHTML = data.events.map(e => `<option value="${e}">${e}</option>`).join('');
+  updateLegSelector();
 }
-// ── Init: load shared data from server ──
+
+// ── Init ──
 loadData().then(d => {
   data = d;
   populateSelects();
+  updateProgress();
 });
 
 // ── Tab Navigation ──
@@ -315,9 +465,23 @@ function renderHistory() {
   raceList.innerHTML = races.map(race => {
     const d = new Date(race.date);
     const dateStr = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const timeStr = d.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' });
     const runnerClass = race.runner.toLowerCase();
+    const cfg = getEventConfig(race.event);
+
+    // Relay leg label
+    const relayLegHtml = race.relayLeg
+      ? `<div class="relay-leg-label">${race.runner} ran Leg ${race.relayLeg}</div>`
+      : '';
+
+    // Splits with relay leg highlight
     const splitsHtml = race.laps.length > 0
-      ? `<div class="splits">${race.laps.map((l, i) => `<span class="split-chip">L${i + 1}: ${formatTime(l.splitMs)}</span>`).join('')}</div>`
+      ? `<div class="splits">${race.laps.map((l, i) => {
+          const label = cfg.relay ? `Leg ${i + 1}` : `L${i + 1}`;
+          const isRunnerLeg = race.relayLeg && (i + 1) === race.relayLeg;
+          const chipClass = isRunnerLeg ? 'split-chip runner-leg' : 'split-chip';
+          return `<span class="${chipClass}">${label}: ${formatTime(l.splitMs)}</span>`;
+        }).join('')}</div>`
       : '';
 
     return `
@@ -325,12 +489,13 @@ function renderHistory() {
         <div class="race-card-header">
           <span class="runner-name ${runnerClass}">${race.runner}</span>
           <span>
-            <span class="race-date">${dateStr}</span>
+            <span class="race-date">${dateStr} ${timeStr}</span>
             <button class="share-btn" data-id="${race.id}" title="Share">&#9993;</button>
             <button class="delete-btn" data-id="${race.id}" title="Delete">&times;</button>
           </span>
         </div>
         <div class="event-name">${race.event}</div>
+        ${relayLegHtml}
         <div class="total-time">${formatTime(race.totalMs)}</div>
         ${splitsHtml}
       </div>
@@ -379,7 +544,6 @@ function renderSettings() {
     </div>
   `).join('');
 
-  // Delete runner
   runnerListEdit.querySelectorAll('button').forEach(btn => {
     btn.addEventListener('click', () => {
       if (data.runners.length <= 1) return alert('Need at least one runner.');
@@ -390,7 +554,6 @@ function renderSettings() {
     });
   });
 
-  // Delete event
   eventListEdit.querySelectorAll('button').forEach(btn => {
     btn.addEventListener('click', () => {
       if (data.events.length <= 1) return alert('Need at least one event.');
@@ -401,7 +564,6 @@ function renderSettings() {
     });
   });
 
-  // Recovery status
   updateRecoveryStatus();
 }
 
@@ -486,7 +648,11 @@ document.getElementById('exportBtn').addEventListener('click', () => {
 function buildShareText(runner, event, totalMs, lapsArr) {
   let text = `${runner} - ${event}\nTime: ${formatTime(totalMs)}`;
   if (lapsArr && lapsArr.length > 0) {
-    const splits = lapsArr.map((l, i) => `L${i + 1} ${formatTime(l.splitMs)}`).join(' | ');
+    const cfg = getEventConfig(event);
+    const splits = lapsArr.map((l, i) => {
+      const label = cfg.relay ? `Leg ${i + 1}` : `L${i + 1}`;
+      return `${label} ${formatTime(l.splitMs)}`;
+    }).join(' | ');
     text += `\nSplits: ${splits}`;
   }
   return text;
@@ -517,24 +683,11 @@ function releaseWakeLock() {
   }
 }
 
-// Re-acquire wake lock if page becomes visible again
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && timerState === 'running') {
     requestWakeLock();
   }
 });
-
-// Wake lock via delegated click handler
-(function patchWakeLock() {
-  document.addEventListener('click', (e) => {
-    if (e.target.id === 'btnStart' || e.target.textContent === 'Start') {
-      requestWakeLock();
-    }
-    if (e.target.id === 'btnStop' || e.target.id === 'btnReset') {
-      releaseWakeLock();
-    }
-  }, true);
-})();
 
 // ── Service Worker Registration ──
 if ('serviceWorker' in navigator) {

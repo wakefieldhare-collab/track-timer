@@ -57,11 +57,12 @@
     .view.active { display: flex; flex-direction: column; }
 
     /* ── Timer View ── */
-    .timer-view { padding: 8px 12px; gap: 6px; }
+    .timer-view { padding: 8px 12px; gap: 4px; }
 
     .setup-row {
       display: flex;
       gap: 8px;
+      flex-shrink: 0;
     }
     .setup-row select {
       flex: 1;
@@ -85,34 +86,75 @@
       font-variant-numeric: tabular-nums;
       letter-spacing: 1px;
       color: #fff;
-      padding: 8px 0;
+      padding: 4px 0;
       font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;
+      flex-shrink: 0;
     }
     .timer-display.running { color: #4ecca3; }
     .timer-display.stopped { color: #e94560; }
 
-    .btn-row {
-      display: flex;
-      gap: 10px;
+    .progress-indicator {
+      text-align: center;
+      font-size: 14px;
+      color: #7a8ba6;
+      font-weight: 600;
+      min-height: 20px;
+      flex-shrink: 0;
     }
-    .btn {
-      flex: 1;
-      padding: 16px 0;
+
+    /* ── Main Button (giant, center) ── */
+    .main-btn-wrap {
+      flex-shrink: 0;
+      padding: 6px 0;
+    }
+    .main-btn {
+      width: 100%;
+      min-height: 180px;
       border: none;
-      border-radius: 12px;
-      font-size: 18px;
-      font-weight: 700;
+      border-radius: 20px;
+      font-size: 36px;
+      font-weight: 800;
       cursor: pointer;
       color: #fff;
       text-transform: uppercase;
+      letter-spacing: 2px;
+      user-select: none;
+      -webkit-user-select: none;
+      touch-action: manipulation;
+      transition: transform 0.06s, opacity 0.06s;
+    }
+    .main-btn:active {
+      transform: scale(0.97);
+      opacity: 0.85;
+    }
+    .main-btn.state-start { background: #4ecca3; color: #1a1a2e; }
+    .main-btn.state-lap { background: #0f3460; }
+    .main-btn.state-finish { background: #e94560; }
+    .main-btn.state-save { background: #4ecca3; color: #1a1a2e; }
+    .main-btn.state-split { background: #0f3460; }
+
+    /* ── Aux Buttons (small, below main) ── */
+    .aux-btns {
+      display: flex;
+      gap: 10px;
+      flex-shrink: 0;
+      min-height: 36px;
+    }
+    .aux-btn {
+      flex: 1;
+      padding: 8px 0;
+      border: none;
+      border-radius: 8px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      color: #eee;
+      text-transform: uppercase;
       letter-spacing: 1px;
     }
-    .btn-start { background: #4ecca3; color: #1a1a2e; }
-    .btn-lap { background: #0f3460; }
-    .btn-lap:disabled { opacity: 0.3; }
-    .btn-stop { background: #e94560; }
-    .btn-reset { background: #333; }
-    .btn-save { background: #4ecca3; color: #1a1a2e; }
+    .aux-btn-stop { background: #333; color: #e94560; }
+    .aux-btn-share { background: #0f3460; }
+    .aux-btn-reset { background: #333; color: #7a8ba6; }
 
     /* ── Lap List ── */
     .lap-list {
@@ -123,12 +165,13 @@
     .lap-item {
       display: flex;
       justify-content: space-between;
-      padding: 6px 4px;
+      padding: 5px 4px;
       border-bottom: 1px solid #16213e;
       font-size: 14px;
       font-variant-numeric: tabular-nums;
     }
-    .lap-item .lap-label { color: #7a8ba6; }
+    .lap-item .lap-label { color: #7a8ba6; min-width: 50px; }
+    .lap-item .lap-label.runner-leg { color: #e9a045; font-weight: 700; }
     .lap-item .lap-split { color: #4ecca3; font-weight: 600; }
     .lap-item .lap-elapsed { color: #aaa; }
 
@@ -183,6 +226,11 @@
     .race-card .event-name {
       font-size: 13px;
       color: #aaa;
+      margin-bottom: 2px;
+    }
+    .race-card .relay-leg-label {
+      font-size: 12px;
+      color: #e9a045;
       margin-bottom: 4px;
     }
     .race-card .total-time {
@@ -205,6 +253,11 @@
       font-variant-numeric: tabular-nums;
       color: #4ecca3;
     }
+    .race-card .split-chip.runner-leg {
+      background: #3d2800;
+      color: #e9a045;
+      font-weight: 700;
+    }
     .race-card .delete-btn {
       background: none;
       border: none;
@@ -221,7 +274,6 @@
       cursor: pointer;
       padding: 2px 6px;
     }
-    .btn-share { background: #0f3460; }
 
     .empty-state {
       text-align: center;
@@ -336,16 +388,20 @@
 
     <!-- ── Timer View ── -->
     <div class="view timer-view active" id="timerView">
-      <div class="setup-row">
+      <div class="setup-row" id="setupRow">
         <select id="runnerSelect"></select>
         <select id="eventSelect"></select>
       </div>
+      <div class="setup-row" id="legRow" style="display: none;">
+        <select id="legSelect"></select>
+      </div>
       <div class="timer-display" id="timerDisplay">0:00.00</div>
-      <div class="btn-row" id="btnRow">
-        <button class="btn btn-start" id="btnStart">Start</button>
-        <button class="btn btn-lap" id="btnLap" disabled>Lap</button>
+      <div class="progress-indicator" id="progressIndicator"></div>
+      <div class="main-btn-wrap">
+        <button class="main-btn state-start" id="mainBtn">START</button>
       </div>
       <div class="lap-list" id="lapList"></div>
+      <div class="aux-btns" id="auxBtns"></div>
     </div>
 
     <!-- ── History View ── -->
