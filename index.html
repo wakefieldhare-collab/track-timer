@@ -174,6 +174,26 @@
     .lap-item .lap-label.runner-leg { color: #e9a045; font-weight: 700; }
     .lap-item .lap-split { color: #4ecca3; font-weight: 600; }
     .lap-item .lap-elapsed { color: #aaa; }
+    .lap-item .lap-delta {
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+      min-width: 52px;
+      text-align: center;
+      color: #7a8ba6;
+    }
+    .lap-item .lap-delta.ahead { color: #4ecca3; }
+    .lap-item .lap-delta.behind { color: #e94560; }
+    .lap-item .lap-delta.neutral { color: #7a8ba6; }
+    .lap-item .lap-delta.tag {
+      color: #e9a045;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      font-weight: 700;
+    }
+    .lap-item.lap-target { opacity: 0.55; }
+    .lap-item.lap-target .lap-split { color: #e9a045; font-weight: 500; }
+    .lap-item.lap-target .lap-elapsed { color: #556878; }
 
     /* ── History View ── */
     .history-view { padding: 8px 12px; gap: 8px; }
@@ -461,6 +481,9 @@
       </div>
       <div class="setup-row" id="legRow" style="display: none;">
         <select id="legSelect"></select>
+      </div>
+      <div class="setup-row" id="targetRow">
+        <input type="text" id="targetInput" placeholder="Target time (e.g. 5:00)" inputmode="decimal" autocomplete="off" style="flex:1; padding:8px 10px; border-radius:8px; border:1px solid #0f3460; background:#16213e; color:#eee; font-size:15px; font-variant-numeric: tabular-nums; font-family: 'SF Mono', 'Cascadia Code', 'Consolas', monospace;">
       </div>
       <div class="timer-display" id="timerDisplay">0:00.00</div>
       <div class="progress-indicator" id="progressIndicator"></div>

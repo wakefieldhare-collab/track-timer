@@ -20,6 +20,80 @@ function getExpectedSplits(eventName) {
   return cfg.laps || null;
 }
 
+// Pacing Profiles
+// Research-based lap distributions as fractions of total time (each sums to 1.0).
+// 1600m: slight U-shape. Lap 1 is slightly fast (fresh legs / adrenaline),
+//   lap 3 is the slowest ("death lap", fatigue bites before the kick),
+//   lap 4 is a kick but rarely as fast as lap 1. Teaches even pacing while
+//   reflecting how real races actually play out.
+// 800m: slightly positive split -- lap 1 ~1.5% faster than lap 2.
+// Single-split events: 100%.
+// Relays: 25% each (each leg is a different runner, so even splits are the
+//   most sensible default at the team level).
+const PACING_PROFILES = {
+  '1600m':         [0.2475, 0.2500, 0.2550, 0.2475],
+  '800m':          [0.4925, 0.5075],
+  '400m':          [1.0000],
+  '300m Hurdles':  [1.0000],
+  '100m Hurdles':  [1.0000],
+  '4x800m Relay':  [0.25, 0.25, 0.25, 0.25],
+  '4x400m Relay':  [0.25, 0.25, 0.25, 0.25],
+  '4x200m Relay':  [0.25, 0.25, 0.25, 0.25],
+};
+
+function getPacingProfile(eventName) {
+  return PACING_PROFILES[eventName] || null;
+}
+
+// Parse target time strings: "5:00", "5:00.5", "300", "300.5".
+// Returns total milliseconds, or null if invalid.
+function parseTargetTime(str) {
+  if (!str) return null;
+  str = String(str).trim();
+  if (!str) return null;
+
+  let totalSec;
+  if (str.includes(':')) {
+    const parts = str.split(':');
+    if (parts.length !== 2) return null;
+    const min = parseInt(parts[0], 10);
+    const sec = parseFloat(parts[1]);
+    if (!isFinite(min) || !isFinite(sec) || min < 0 || sec < 0 || sec >= 60) return null;
+    totalSec = min * 60 + sec;
+  } else {
+    totalSec = parseFloat(str);
+    if (!isFinite(totalSec)) return null;
+  }
+
+  if (totalSec <= 0) return null;
+  return Math.round(totalSec * 1000);
+}
+
+// Compute target splits for an event given a total target in ms.
+// Returns an array of { splitMs, elapsedMs } or null if unavailable.
+function getTargetSplits(event, totalMs) {
+  const profile = getPacingProfile(event);
+  if (!profile || !totalMs) return null;
+
+  const splits = profile.map(pct => Math.round(totalMs * pct));
+  // Fix rounding drift so the sum equals totalMs exactly.
+  const sum = splits.reduce((a, b) => a + b, 0);
+  splits[splits.length - 1] += (totalMs - sum);
+
+  let cumulative = 0;
+  return splits.map(s => {
+    cumulative += s;
+    return { splitMs: s, elapsedMs: cumulative };
+  });
+}
+
+// Format a delta ms as "+1.23" or "-0.45" (two decimal seconds, always signed).
+function formatDelta(ms) {
+  const absSec = Math.abs(ms) / 1000;
+  const sign = ms >= 0 ? '+' : '-';
+  return sign + absSec.toFixed(2);
+}
+
 // ── Data Layer ──
 const API_BASE = 'https://gtf-desktop.tail98708b.ts.net:3456';
 
@@ -31,6 +105,7 @@ const DEFAULT_DATA = {
 
 const CACHE_KEY = 'trackTimerCache';
 const MEET_KEY = 'trackTimerMeet';
+const TARGETS_KEY = 'trackTimerTargets';
 let serverConnected = false;
 
 // ── Connection Status ──
@@ -156,6 +231,7 @@ let laps = [];
 let lastLapTime = 0;
 let rafId = null;
 let lastTapTime = 0;
+let targetMs = null; // Current race target in ms, null = no target set
 
 // ── DOM Refs ──
 const timerDisplay = document.getElementById('timerDisplay');
@@ -168,12 +244,46 @@ const legRow = document.getElementById('legRow');
 const legSelect = document.getElementById('legSelect');
 const progressIndicator = document.getElementById('progressIndicator');
 const meetInput = document.getElementById('meetInput');
+const targetInput = document.getElementById('targetInput');
 
 // ── Meet Name Persistence ──
 // Remember the last meet name so you don't re-type it between races
 meetInput.value = localStorage.getItem(MEET_KEY) || '';
 meetInput.addEventListener('input', () => {
   localStorage.setItem(MEET_KEY, meetInput.value);
+});
+
+// Target time persistence: stored per event so 1600m and 800m remember
+// their own targets independently.
+function getStoredTargets() {
+  try {
+    return JSON.parse(localStorage.getItem(TARGETS_KEY) || '{}');
+  } catch { return {}; }
+}
+
+function setStoredTarget(event, value) {
+  const all = getStoredTargets();
+  if (value && parseTargetTime(value) !== null) {
+    all[event] = value;
+  } else {
+    delete all[event];
+  }
+  localStorage.setItem(TARGETS_KEY, JSON.stringify(all));
+}
+
+function loadTargetForCurrentEvent() {
+  const all = getStoredTargets();
+  const val = all[eventSelect.value] || '';
+  targetInput.value = val;
+  targetMs = parseTargetTime(val);
+}
+
+targetInput.addEventListener('input', () => {
+  targetMs = parseTargetTime(targetInput.value);
+  setStoredTarget(eventSelect.value, targetInput.value);
+  if (timerState === 'idle') {
+    renderLaps();
+  }
 });
 
 // ── Format Time ──
@@ -204,19 +314,50 @@ function getSplitLabel(index) {
 function renderLaps() {
   const cfg = getEventConfig(eventSelect.value);
   const runnerLeg = cfg.relay ? parseInt(legSelect.value) : null;
+  const targets = getTargetSplits(eventSelect.value, targetMs);
 
-  lapList.innerHTML = laps.map((lap, i) => {
+  // Completed laps, newest-first (preserves original ordering).
+  const actualRows = laps.map((lap, i) => {
     const label = getSplitLabel(i);
     const isRunnerLeg = runnerLeg && (i + 1) === runnerLeg;
     const labelClass = isRunnerLeg ? 'lap-label runner-leg' : 'lap-label';
+
+    let deltaHtml = '<span class="lap-delta"></span>';
+    if (targets && targets[i]) {
+      const delta = lap.splitMs - targets[i].splitMs;
+      const cls = Math.abs(delta) < 200 ? 'neutral' : (delta < 0 ? 'ahead' : 'behind');
+      deltaHtml = `<span class="lap-delta ${cls}">${formatDelta(delta)}</span>`;
+    }
+
     return `
       <div class="lap-item">
         <span class="${labelClass}">${label}</span>
         <span class="lap-split">${formatTime(lap.splitMs)}</span>
+        ${deltaHtml}
         <span class="lap-elapsed">${formatTime(lap.elapsedMs)}</span>
       </div>
     `;
-  }).reverse().join('');
+  }).reverse();
+
+  // Upcoming target rows, soonest-first. Hidden once the race is stopped so
+  // the final display only shows actuals with their deltas.
+  const targetRows = [];
+  if (targets && timerState !== 'stopped') {
+    for (let i = laps.length; i < targets.length; i++) {
+      const t = targets[i];
+      const label = getSplitLabel(i);
+      targetRows.push(`
+      <div class="lap-item lap-target">
+        <span class="lap-label">${label}</span>
+        <span class="lap-split">${formatTime(t.splitMs)}</span>
+        <span class="lap-delta tag">target</span>
+        <span class="lap-elapsed">${formatTime(t.elapsedMs)}</span>
+      </div>
+    `);
+    }
+  }
+
+  lapList.innerHTML = [...actualRows, ...targetRows].join('');
 }
 
 // ── Progress Indicator ──
@@ -342,7 +483,7 @@ function doStart() {
   elapsed = 0;
   laps = [];
   lastLapTime = 0;
-  lapList.innerHTML = '';
+  renderLaps();
   timerDisplay.classList.add('running');
   timerDisplay.classList.remove('stopped');
   tick();
@@ -351,6 +492,7 @@ function doStart() {
   eventSelect.disabled = true;
   legSelect.disabled = true;
   meetInput.disabled = true;
+  targetInput.disabled = true;
 
   updateMainButton();
   updateAuxButtons();
@@ -380,12 +522,11 @@ function doStop() {
     const lastElapsed = laps[laps.length - 1].elapsedMs;
     if (elapsed - lastElapsed > 50) {
       laps.push({ splitMs: elapsed - lastElapsed, elapsedMs: elapsed });
-      renderLaps();
     }
   } else {
     laps.push({ splitMs: elapsed, elapsedMs: elapsed });
-    renderLaps();
   }
+  renderLaps();
 
   updateMainButton();
   updateAuxButtons();
@@ -426,17 +567,18 @@ function doReset() {
   elapsed = 0;
   laps = [];
   lastLapTime = 0;
-  lapList.innerHTML = '';
   timerDisplay.textContent = '0:00.00';
   timerDisplay.classList.remove('running', 'stopped');
   runnerSelect.disabled = false;
   eventSelect.disabled = false;
   legSelect.disabled = false;
   meetInput.disabled = false;
+  targetInput.disabled = false;
 
   updateMainButton();
   updateAuxButtons();
   updateProgress();
+  renderLaps();
 }
 
 // ── Relay Leg Selector ──
@@ -454,7 +596,11 @@ function updateLegSelector() {
   updateProgress();
 }
 
-eventSelect.addEventListener('change', updateLegSelector);
+eventSelect.addEventListener('change', () => {
+  updateLegSelector();
+  loadTargetForCurrentEvent();
+  if (timerState === 'idle') renderLaps();
+});
 
 // ── Populate Selects ──
 function populateSelects() {
@@ -467,7 +613,9 @@ function populateSelects() {
 loadData().then(d => {
   data = d;
   populateSelects();
+  loadTargetForCurrentEvent();
   updateProgress();
+  renderLaps();
 });
 
 // ── Tab Navigation ──
