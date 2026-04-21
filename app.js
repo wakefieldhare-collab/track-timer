@@ -170,6 +170,7 @@ function subscribeToData() {
       if (!initialSyncDone && !snap.metadata.fromCache) {
         initialSyncDone = true;
         flushPendingRaces();
+        migrateLegacyCache();
       }
     },
     (err) => {
@@ -212,6 +213,42 @@ async function flushPendingRaces() {
     console.log(`Flushed ${pending.length} pending races to Firestore`);
   } catch (e) {
     console.warn('Could not flush pending races yet:', e);
+  }
+}
+
+// One-time migration: the pre-Firebase app cached races in 'trackTimerCache'.
+// If a family member still has that cache from before the migration, merge
+// any races we don't yet have into Firestore, then delete the legacy key.
+const LEGACY_CACHE_KEY = 'trackTimerCache';
+const LEGACY_MIGRATED_KEY = 'trackTimerLegacyMigrated';
+
+async function migrateLegacyCache() {
+  if (localStorage.getItem(LEGACY_MIGRATED_KEY) === '1') return;
+  let legacy;
+  try {
+    const raw = localStorage.getItem(LEGACY_CACHE_KEY);
+    if (!raw) {
+      localStorage.setItem(LEGACY_MIGRATED_KEY, '1');
+      return;
+    }
+    legacy = JSON.parse(raw);
+  } catch {
+    localStorage.setItem(LEGACY_MIGRATED_KEY, '1');
+    return;
+  }
+  const legacyRaces = Array.isArray(legacy && legacy.races) ? legacy.races : [];
+  if (legacyRaces.length === 0) {
+    localStorage.removeItem(LEGACY_CACHE_KEY);
+    localStorage.setItem(LEGACY_MIGRATED_KEY, '1');
+    return;
+  }
+  try {
+    await mergeRaces(legacyRaces);
+    console.log(`Legacy cache migration: pushed ${legacyRaces.length} races to Firestore`);
+    localStorage.removeItem(LEGACY_CACHE_KEY);
+    localStorage.setItem(LEGACY_MIGRATED_KEY, '1');
+  } catch (e) {
+    console.warn('Legacy cache migration will retry next sync:', e);
   }
 }
 
