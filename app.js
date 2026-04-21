@@ -1,3 +1,44 @@
+// ── Firebase ──
+import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-app.js';
+import {
+  getAuth,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
+  signOut,
+  onAuthStateChanged,
+  setPersistence,
+  browserLocalPersistence
+} from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
+import {
+  initializeFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+  doc,
+  onSnapshot,
+  runTransaction,
+  serverTimestamp
+} from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
+
+const firebaseConfig = {
+  apiKey: 'AIzaSyCrNdm3Lz5ZjKjpiwJM1XDIbomZBp1C-WU',
+  authDomain: 'hare-family-apps.firebaseapp.com',
+  projectId: 'hare-family-apps',
+  appId: '1:1023984004573:web:a93fcf54eeb313b6b49a34',
+  storageBucket: 'hare-family-apps.firebasestorage.app',
+  messagingSenderId: '1023984004573'
+};
+
+const firebaseApp = initializeApp(firebaseConfig);
+const auth = getAuth(firebaseApp);
+const db = initializeFirestore(firebaseApp, {
+  localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() })
+});
+const stateRef = doc(db, 'trackTimer', 'state');
+
+setPersistence(auth, browserLocalPersistence).catch(() => {});
+
 // ── Event Configuration ──
 const EVENT_CONFIG = {
   '1600m':          { laps: 4, relay: false },
@@ -20,16 +61,6 @@ function getExpectedSplits(eventName) {
   return cfg.laps || null;
 }
 
-// Pacing Profiles
-// Research-based lap distributions as fractions of total time (each sums to 1.0).
-// 1600m: slight U-shape. Lap 1 is slightly fast (fresh legs / adrenaline),
-//   lap 3 is the slowest ("death lap", fatigue bites before the kick),
-//   lap 4 is a kick but rarely as fast as lap 1. Teaches even pacing while
-//   reflecting how real races actually play out.
-// 800m: slightly positive split -- lap 1 ~1.5% faster than lap 2.
-// Single-split events: 100%.
-// Relays: 25% each (each leg is a different runner, so even splits are the
-//   most sensible default at the team level).
 const PACING_PROFILES = {
   '1600m':         [0.2475, 0.2500, 0.2550, 0.2475],
   '800m':          [0.4925, 0.5075],
@@ -45,13 +76,10 @@ function getPacingProfile(eventName) {
   return PACING_PROFILES[eventName] || null;
 }
 
-// Parse target time strings: "5:00", "5:00.5", "300", "300.5".
-// Returns total milliseconds, or null if invalid.
 function parseTargetTime(str) {
   if (!str) return null;
   str = String(str).trim();
   if (!str) return null;
-
   let totalSec;
   if (str.includes(':')) {
     const parts = str.split(':');
@@ -64,22 +92,16 @@ function parseTargetTime(str) {
     totalSec = parseFloat(str);
     if (!isFinite(totalSec)) return null;
   }
-
   if (totalSec <= 0) return null;
   return Math.round(totalSec * 1000);
 }
 
-// Compute target splits for an event given a total target in ms.
-// Returns an array of { splitMs, elapsedMs } or null if unavailable.
 function getTargetSplits(event, totalMs) {
   const profile = getPacingProfile(event);
   if (!profile || !totalMs) return null;
-
   const splits = profile.map(pct => Math.round(totalMs * pct));
-  // Fix rounding drift so the sum equals totalMs exactly.
   const sum = splits.reduce((a, b) => a + b, 0);
   splits[splits.length - 1] += (totalMs - sum);
-
   let cumulative = 0;
   return splits.map(s => {
     cumulative += s;
@@ -87,107 +109,159 @@ function getTargetSplits(event, totalMs) {
   });
 }
 
-// Format a delta ms as "+1.23" or "-0.45" (two decimal seconds, always signed).
 function formatDelta(ms) {
   const absSec = Math.abs(ms) / 1000;
   const sign = ms >= 0 ? '+' : '-';
   return sign + absSec.toFixed(2);
 }
 
-// ── Data Layer ──
-const API_BASE = 'https://gtf-desktop.tail98708b.ts.net:3456';
-
+// ── Data Layer (Firestore) ──
 const DEFAULT_DATA = {
   runners: ['Hanner', 'Billie'],
   events: ['1600m', '800m', '400m', '300m Hurdles', '100m Hurdles', '4x800m Relay', '4x400m Relay', '4x200m Relay'],
   races: []
 };
 
-const CACHE_KEY = 'trackTimerCache';
 const MEET_KEY = 'trackTimerMeet';
 const TARGETS_KEY = 'trackTimerTargets';
-let serverConnected = false;
+const PENDING_RACES_KEY = 'trackTimerPendingRaces';
 
-// ── Connection Status ──
+let data = { ...DEFAULT_DATA, races: [] };
+let currentUser = null;
+let dataUnsub = null;
+let initialSyncDone = false;
+
 function updateConnectionStatus(connected) {
-  serverConnected = connected;
   const dot = document.getElementById('connStatus');
   if (dot) {
     dot.className = 'conn-dot ' + (connected ? 'connected' : 'disconnected');
-    dot.title = connected ? 'Server connected' : 'Offline -- data saved locally only';
+    dot.title = connected ? 'Synced' : 'Offline — changes will sync when online';
   }
 }
 
-async function checkConnection() {
-  try {
-    const res = await fetch(API_BASE + '/api/data', { method: 'HEAD', signal: AbortSignal.timeout(3000) });
-    updateConnectionStatus(res.ok);
-  } catch {
-    updateConnectionStatus(false);
-  }
-}
-
-setInterval(checkConnection, 30000);
-
-async function loadData() {
-  try {
-    const res = await fetch(API_BASE + '/api/data', { signal: AbortSignal.timeout(5000) });
-    if (res.ok) {
-      const d = await res.json();
-      updateConnectionStatus(true);
-
-      const cached = getLocalCache();
-      if (cached && cached.races && cached.races.length > 0) {
-        const serverIds = new Set(d.races.map(r => r.id));
-        const localOnly = cached.races.filter(r => !serverIds.has(r.id));
-        if (localOnly.length > 0) {
-          d.races = [...localOnly, ...d.races];
-          d.races.sort((a, b) => new Date(b.date) - new Date(a.date));
-          fetch(API_BASE + '/api/data', {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(d)
-          }).catch(() => {});
-        }
+function subscribeToData() {
+  unsubscribeFromData();
+  dataUnsub = onSnapshot(
+    stateRef,
+    { includeMetadataChanges: true },
+    (snap) => {
+      if (snap.exists()) {
+        const d = snap.data();
+        data = {
+          runners: Array.isArray(d.runners) ? d.runners : DEFAULT_DATA.runners,
+          events: Array.isArray(d.events) ? d.events : DEFAULT_DATA.events,
+          races: Array.isArray(d.races) ? d.races : []
+        };
+      } else {
+        data = { ...DEFAULT_DATA, races: [] };
       }
+      updateConnectionStatus(!snap.metadata.fromCache);
 
-      localStorage.setItem(CACHE_KEY, JSON.stringify(d));
-      return d;
+      populateSelects();
+      loadTargetForCurrentEvent();
+      if (timerState === 'idle') renderLaps();
+      updateProgress();
+
+      const historyActive = document.getElementById('historyView').classList.contains('active');
+      const settingsActive = document.getElementById('settingsView').classList.contains('active');
+      if (historyActive) renderHistory();
+      if (settingsActive) renderSettings();
+
+      if (!initialSyncDone && !snap.metadata.fromCache) {
+        initialSyncDone = true;
+        flushPendingRaces();
+      }
+    },
+    (err) => {
+      console.error('Firestore listener error:', err);
+      if (err && err.code === 'permission-denied') {
+        showAuthError('Your account is not authorized for Track Timer. Ask Wake to add your Gmail.');
+        signOut(auth).catch(() => {});
+      } else {
+        updateConnectionStatus(false);
+      }
     }
-  } catch (e) { /* server unreachable */ }
-
-  updateConnectionStatus(false);
-  const cached = getLocalCache();
-  if (cached) return cached;
-  return { ...DEFAULT_DATA, races: [] };
+  );
 }
 
-function getLocalCache() {
+function unsubscribeFromData() {
+  if (dataUnsub) { dataUnsub(); dataUnsub = null; }
+}
+
+function getPendingRaces() {
   try {
-    const raw = localStorage.getItem(CACHE_KEY);
-    if (raw) return JSON.parse(raw);
-  } catch (e) { /* ignore */ }
-  return null;
+    const raw = localStorage.getItem(PENDING_RACES_KEY);
+    return raw ? JSON.parse(raw) : [];
+  } catch { return []; }
 }
 
-function saveData(d) {
-  localStorage.setItem(CACHE_KEY, JSON.stringify(d));
-  fetch(API_BASE + '/api/data', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(d)
-  }).then(res => {
-    if (res.ok) { updateConnectionStatus(true); return res.json(); }
-    throw new Error('Server save failed');
-  }).catch(() => {
-    updateConnectionStatus(false);
+function setPendingRaces(races) {
+  if (races && races.length > 0) {
+    localStorage.setItem(PENDING_RACES_KEY, JSON.stringify(races));
+  } else {
+    localStorage.removeItem(PENDING_RACES_KEY);
+  }
+}
+
+async function flushPendingRaces() {
+  const pending = getPendingRaces();
+  if (pending.length === 0) return;
+  try {
+    await mergeRaces(pending);
+    setPendingRaces([]);
+    console.log(`Flushed ${pending.length} pending races to Firestore`);
+  } catch (e) {
+    console.warn('Could not flush pending races yet:', e);
+  }
+}
+
+async function mergeRaces(newRaces) {
+  if (!currentUser) throw new Error('not signed in');
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(stateRef);
+    const current = snap.exists() ? snap.data() : DEFAULT_DATA;
+    const existingIds = new Set((current.races || []).map(r => r.id));
+    const toAdd = (newRaces || []).filter(r => !existingIds.has(r.id));
+    if (toAdd.length === 0) return;
+    const merged = {
+      runners: current.runners || DEFAULT_DATA.runners,
+      events: current.events || DEFAULT_DATA.events,
+      races: [...toAdd, ...(current.races || [])].sort((a, b) => new Date(b.date) - new Date(a.date)),
+      updatedAt: serverTimestamp()
+    };
+    tx.set(stateRef, merged);
   });
 }
 
-let data = { ...DEFAULT_DATA, races: [] };
+async function saveData(newData) {
+  if (!currentUser) return;
+  try {
+    await runTransaction(db, async (tx) => {
+      const snap = await tx.get(stateRef);
+      const current = snap.exists() ? snap.data() : DEFAULT_DATA;
+      const existingIds = new Set((current.races || []).map(r => r.id));
+      const newOnly = (newData.races || []).filter(r => !existingIds.has(r.id));
+      tx.set(stateRef, {
+        runners: Array.isArray(newData.runners) ? newData.runners : (current.runners || DEFAULT_DATA.runners),
+        events: Array.isArray(newData.events) ? newData.events : (current.events || DEFAULT_DATA.events),
+        races: [...newOnly, ...(current.races || [])].sort((a, b) => new Date(b.date) - new Date(a.date)),
+        updatedAt: serverTimestamp()
+      });
+    });
+    updateConnectionStatus(true);
+  } catch (e) {
+    console.error('Save failed:', e);
+    updateConnectionStatus(false);
+  }
+}
+
+function queueRaceForSync(race) {
+  const pending = getPendingRaces();
+  pending.push(race);
+  setPendingRaces(pending);
+}
 
 // ── PR Detection ──
-// Returns the current PR time for a runner+event combo, excluding a given race ID
 function getPR(runner, event, excludeId) {
   const matching = data.races.filter(r =>
     r.runner === runner && r.event === event && r.id !== excludeId
@@ -196,17 +270,15 @@ function getPR(runner, event, excludeId) {
   return Math.min(...matching.map(r => r.totalMs));
 }
 
-// Check if a time is a PR
 function isPR(race) {
   const previousBest = getPR(race.runner, race.event, race.id);
-  if (previousBest === null) return true; // First time = PR
+  if (previousBest === null) return true;
   return race.totalMs < previousBest;
 }
 
-// Get PR diff string
 function getPRDiff(race) {
   const previousBest = getPR(race.runner, race.event, race.id);
-  if (previousBest === null) return null; // First race, no comparison
+  if (previousBest === null) return null;
   const diff = race.totalMs - previousBest;
   if (diff < 0) {
     return { improved: true, text: '-' + formatTime(Math.abs(diff)) };
@@ -218,7 +290,6 @@ function getPRDiff(race) {
 function showPRToast() {
   const toast = document.getElementById('prToast');
   toast.classList.add('show');
-  // Haptic burst for PR
   if (navigator.vibrate) navigator.vibrate([100, 50, 100, 50, 200]);
   setTimeout(() => { toast.classList.remove('show'); }, 2000);
 }
@@ -231,7 +302,7 @@ let laps = [];
 let lastLapTime = 0;
 let rafId = null;
 let lastTapTime = 0;
-let targetMs = null; // Current race target in ms, null = no target set
+let targetMs = null;
 
 // ── DOM Refs ──
 const timerDisplay = document.getElementById('timerDisplay');
@@ -247,14 +318,11 @@ const meetInput = document.getElementById('meetInput');
 const targetInput = document.getElementById('targetInput');
 
 // ── Meet Name Persistence ──
-// Remember the last meet name so you don't re-type it between races
 meetInput.value = localStorage.getItem(MEET_KEY) || '';
 meetInput.addEventListener('input', () => {
   localStorage.setItem(MEET_KEY, meetInput.value);
 });
 
-// Target time persistence: stored per event so 1600m and 800m remember
-// their own targets independently.
 function getStoredTargets() {
   try {
     return JSON.parse(localStorage.getItem(TARGETS_KEY) || '{}');
@@ -286,7 +354,6 @@ targetInput.addEventListener('input', () => {
   }
 });
 
-// ── Format Time ──
 function formatTime(ms) {
   const totalSec = ms / 1000;
   const minutes = Math.floor(totalSec / 60);
@@ -296,27 +363,23 @@ function formatTime(ms) {
   return `${minutes}:${sec.toString().padStart(2, '0')}.${hundredths.toString().padStart(2, '0')}`;
 }
 
-// ── Timer Loop ──
 function tick() {
   elapsed = performance.now() - startTime;
   timerDisplay.textContent = formatTime(elapsed);
   rafId = requestAnimationFrame(tick);
 }
 
-// ── Split Label ──
 function getSplitLabel(index) {
   const cfg = getEventConfig(eventSelect.value);
   if (cfg.relay) return `Leg ${index + 1}`;
   return `Lap ${index + 1}`;
 }
 
-// ── Render Laps ──
 function renderLaps() {
   const cfg = getEventConfig(eventSelect.value);
   const runnerLeg = cfg.relay ? parseInt(legSelect.value) : null;
   const targets = getTargetSplits(eventSelect.value, targetMs);
 
-  // Completed laps, newest-first (preserves original ordering).
   const actualRows = laps.map((lap, i) => {
     const label = getSplitLabel(i);
     const isRunnerLeg = runnerLeg && (i + 1) === runnerLeg;
@@ -339,8 +402,6 @@ function renderLaps() {
     `;
   }).reverse();
 
-  // Upcoming target rows, soonest-first. Hidden once the race is stopped so
-  // the final display only shows actuals with their deltas.
   const targetRows = [];
   if (targets && timerState !== 'stopped') {
     for (let i = laps.length; i < targets.length; i++) {
@@ -360,7 +421,6 @@ function renderLaps() {
   lapList.innerHTML = [...actualRows, ...targetRows].join('');
 }
 
-// ── Progress Indicator ──
 function updateProgress() {
   const expected = getExpectedSplits(eventSelect.value);
   const cfg = getEventConfig(eventSelect.value);
@@ -393,7 +453,6 @@ function updateProgress() {
   }
 }
 
-// ── Main Button Label & Style ──
 function updateMainButton() {
   const cfg = getEventConfig(eventSelect.value);
   const expected = getExpectedSplits(eventSelect.value);
@@ -424,7 +483,6 @@ function updateMainButton() {
   }
 }
 
-// ── Aux Buttons ──
 function updateAuxButtons() {
   if (timerState === 'idle') {
     auxBtns.innerHTML = '';
@@ -443,12 +501,10 @@ function updateAuxButtons() {
   }
 }
 
-// ── Haptic Feedback ──
 function hapticTap() {
   if (navigator.vibrate) navigator.vibrate(40);
 }
 
-// ── Main Button Handler ──
 function doMainButton() {
   const now = Date.now();
   if (now - lastTapTime < 400) return;
@@ -476,7 +532,6 @@ function doMainButton() {
 
 mainBtn.addEventListener('click', doMainButton);
 
-// ── Timer Actions ──
 function doStart() {
   timerState = 'running';
   startTime = performance.now();
@@ -534,7 +589,7 @@ function doStop() {
   releaseWakeLock();
 }
 
-function doSave() {
+async function doSave() {
   const cfg = getEventConfig(eventSelect.value);
   const meetName = meetInput.value.trim() || null;
 
@@ -549,11 +604,18 @@ function doSave() {
     laps: laps.map(l => ({ splitMs: Math.round(l.splitMs), elapsedMs: Math.round(l.elapsedMs) }))
   };
 
-  // Check PR before adding (so it compares against existing races only)
   const isNewPR = isPR(race);
 
+  queueRaceForSync(race);
   data.races.unshift(race);
-  saveData(data);
+
+  try {
+    await mergeRaces([race]);
+    const pending = getPendingRaces().filter(r => r.id !== race.id);
+    setPendingRaces(pending);
+  } catch (e) {
+    console.warn('Race queued locally, will sync when online:', e);
+  }
 
   if (isNewPR) {
     showPRToast();
@@ -581,7 +643,6 @@ function doReset() {
   renderLaps();
 }
 
-// ── Relay Leg Selector ──
 function updateLegSelector() {
   const cfg = getEventConfig(eventSelect.value);
   if (cfg.relay) {
@@ -602,23 +663,16 @@ eventSelect.addEventListener('change', () => {
   if (timerState === 'idle') renderLaps();
 });
 
-// ── Populate Selects ──
 function populateSelects() {
+  const prevRunner = runnerSelect.value;
+  const prevEvent = eventSelect.value;
   runnerSelect.innerHTML = data.runners.map(r => `<option value="${r}">${r}</option>`).join('');
   eventSelect.innerHTML = data.events.map(e => `<option value="${e}">${e}</option>`).join('');
+  if (prevRunner && data.runners.includes(prevRunner)) runnerSelect.value = prevRunner;
+  if (prevEvent && data.events.includes(prevEvent)) eventSelect.value = prevEvent;
   updateLegSelector();
 }
 
-// ── Init ──
-loadData().then(d => {
-  data = d;
-  populateSelects();
-  loadTargetForCurrentEvent();
-  updateProgress();
-  renderLaps();
-});
-
-// ── Tab Navigation ──
 const tabs = document.querySelectorAll('.tab-bar button');
 const views = document.querySelectorAll('.view');
 
@@ -629,31 +683,33 @@ tabs.forEach(tab => {
     tab.classList.add('active');
     document.getElementById(tab.dataset.tab + 'View').classList.add('active');
 
-    if (tab.dataset.tab === 'history') {
-      loadData().then(d => { data = d; renderHistory(); });
-    }
-    if (tab.dataset.tab === 'settings') {
-      loadData().then(d => { data = d; populateSelects(); renderSettings(); });
-    }
+    if (tab.dataset.tab === 'history') renderHistory();
+    if (tab.dataset.tab === 'settings') renderSettings();
   });
 });
 
-// ── History View ──
 const filterRunner = document.getElementById('filterRunner');
 const filterEvent = document.getElementById('filterEvent');
 const filterMeet = document.getElementById('filterMeet');
 const raceList = document.getElementById('raceList');
 
 function populateFilters() {
+  const prevR = filterRunner.value;
+  const prevE = filterEvent.value;
+  const prevM = filterMeet.value;
+
   filterRunner.innerHTML = '<option value="all">All Runners</option>' +
     data.runners.map(r => `<option value="${r}">${r}</option>`).join('');
   filterEvent.innerHTML = '<option value="all">All Events</option>' +
     data.events.map(e => `<option value="${e}">${e}</option>`).join('');
 
-  // Populate meet filter from actual race data
   const meets = [...new Set(data.races.map(r => r.meet).filter(Boolean))];
   filterMeet.innerHTML = '<option value="all">All Meets</option>' +
     meets.map(m => `<option value="${m}">${m}</option>`).join('');
+
+  if (prevR) filterRunner.value = prevR;
+  if (prevE) filterEvent.value = prevE;
+  if (prevM) filterMeet.value = prevM;
 }
 
 function renderHistory() {
@@ -672,7 +728,6 @@ function renderHistory() {
     return;
   }
 
-  // Group races by meet (or by date if no meet)
   const groups = [];
   let currentGroup = null;
 
@@ -690,7 +745,6 @@ function renderHistory() {
 
   let html = '';
   for (const group of groups) {
-    // Meet header
     if (group.meet) {
       html += `<div class="meet-header">${group.meet}<span class="meet-date">${group.date}</span></div>`;
     } else {
@@ -704,7 +758,6 @@ function renderHistory() {
 
   raceList.innerHTML = html;
 
-  // Share handlers
   raceList.querySelectorAll('.share-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const race = data.races.find(r => r.id === btn.dataset.id);
@@ -712,13 +765,22 @@ function renderHistory() {
     });
   });
 
-  // Delete handlers
   raceList.querySelectorAll('.delete-btn').forEach(btn => {
-    btn.addEventListener('click', () => {
-      if (confirm('Delete this race?')) {
-        data.races = data.races.filter(r => r.id !== btn.dataset.id);
-        saveData(data);
-        renderHistory();
+    btn.addEventListener('click', async () => {
+      if (!confirm('Delete this race?')) return;
+      try {
+        await runTransaction(db, async (tx) => {
+          const snap = await tx.get(stateRef);
+          const current = snap.exists() ? snap.data() : DEFAULT_DATA;
+          tx.set(stateRef, {
+            runners: current.runners || DEFAULT_DATA.runners,
+            events: current.events || DEFAULT_DATA.events,
+            races: (current.races || []).filter(r => r.id !== btn.dataset.id),
+            updatedAt: serverTimestamp()
+          });
+        });
+      } catch (e) {
+        alert('Delete failed: ' + (e.message || e));
       }
     });
   });
@@ -730,7 +792,6 @@ function renderRaceCard(race) {
   const runnerClass = race.runner.toLowerCase();
   const cfg = getEventConfig(race.event);
 
-  // PR detection
   const prFlag = isPR(race);
   const prDiff = getPRDiff(race);
   const prBadgeHtml = prFlag ? '<span class="pr-badge">PR</span>' : '';
@@ -739,12 +800,10 @@ function renderRaceCard(race) {
     : '';
   const prCardClass = prFlag ? 'race-card is-pr' : 'race-card';
 
-  // Relay leg label
   const relayLegHtml = race.relayLeg
     ? `<div class="relay-leg-label">${race.runner} ran Leg ${race.relayLeg}</div>`
     : '';
 
-  // Splits with relay leg highlight
   const splitsHtml = race.laps.length > 0
     ? `<div class="splits">${race.laps.map((l, i) => {
         const label = cfg.relay ? `Leg ${i + 1}` : `L${i + 1}`;
@@ -776,7 +835,6 @@ filterRunner.addEventListener('change', renderHistory);
 filterEvent.addEventListener('change', renderHistory);
 filterMeet.addEventListener('change', renderHistory);
 
-// ── Settings View ──
 function renderSettings() {
   const runnerListEdit = document.getElementById('runnerListEdit');
   const eventListEdit = document.getElementById('eventListEdit');
@@ -796,95 +854,61 @@ function renderSettings() {
   `).join('');
 
   runnerListEdit.querySelectorAll('button').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       if (data.runners.length <= 1) return alert('Need at least one runner.');
-      data.runners = data.runners.filter(r => r !== btn.dataset.runner);
-      saveData(data);
-      populateSelects();
-      renderSettings();
+      const next = { ...data, runners: data.runners.filter(r => r !== btn.dataset.runner) };
+      await saveData(next);
     });
   });
 
   eventListEdit.querySelectorAll('button').forEach(btn => {
-    btn.addEventListener('click', () => {
+    btn.addEventListener('click', async () => {
       if (data.events.length <= 1) return alert('Need at least one event.');
-      data.events = data.events.filter(e => e !== btn.dataset.event);
-      saveData(data);
-      populateSelects();
-      renderSettings();
+      const next = { ...data, events: data.events.filter(e => e !== btn.dataset.event) };
+      await saveData(next);
     });
   });
 
-  updateRecoveryStatus();
+  updateAccountStatus();
 }
 
-// ── Recovery ──
-function updateRecoveryStatus() {
+function updateAccountStatus() {
   const el = document.getElementById('recoveryStatus');
   if (!el) return;
-  const cached = getLocalCache();
-  const localRaces = cached ? (cached.races || []).length : 0;
-  const serverRaces = data.races.length;
-
-  if (localRaces > 0 && localRaces > serverRaces) {
-    el.innerHTML = `<div class="recovery-alert">Found ${localRaces} races in local cache (server has ${serverRaces}). <button id="recoverLocalBtn" class="recover-btn">Recover Local Data</button></div>`;
-    document.getElementById('recoverLocalBtn').addEventListener('click', recoverFromLocal);
-  } else {
-    el.innerHTML = `<div class="recovery-info">${serverRaces} races on server, ${localRaces} in local cache.</div>`;
-  }
+  const pending = getPendingRaces().length;
+  const raceCount = data.races.length;
+  const email = currentUser ? currentUser.email : '(signed out)';
+  el.innerHTML = `
+    <div class="recovery-info">
+      Signed in as <b>${email}</b><br>
+      ${raceCount} race${raceCount === 1 ? '' : 's'} synced${pending > 0 ? `, ${pending} pending` : ''}.
+    </div>
+    <button class="export-btn" id="signOutBtn" style="background:#3a1a1a;color:#e94560;margin-top:6px;">Sign out</button>
+  `;
+  const btn = document.getElementById('signOutBtn');
+  if (btn) btn.addEventListener('click', doSignOut);
 }
 
-async function recoverFromLocal() {
-  const cached = getLocalCache();
-  if (!cached || !cached.races || cached.races.length === 0) {
-    alert('No local data to recover.');
-    return;
-  }
-  try {
-    const res = await fetch(API_BASE + '/api/recover', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ races: cached.races })
-    });
-    if (res.ok) {
-      const result = await res.json();
-      alert(`Recovered ${result.recovered} races! Total: ${result.raceCount}`);
-      loadData().then(d => { data = d; renderSettings(); });
-    } else {
-      alert('Recovery failed. Server may be unreachable.');
-    }
-  } catch {
-    alert('Could not reach server for recovery.');
-  }
-}
-
-// Add runner
-document.getElementById('addRunnerBtn').addEventListener('click', () => {
+document.getElementById('addRunnerBtn').addEventListener('click', async () => {
   const input = document.getElementById('newRunnerInput');
   const name = input.value.trim();
   if (!name) return;
   if (data.runners.includes(name)) return alert('Runner already exists.');
-  data.runners.push(name);
-  saveData(data);
+  const next = { ...data, runners: [...data.runners, name] };
   input.value = '';
-  populateSelects();
-  renderSettings();
+  await saveData(next);
 });
 
-// Add event
-document.getElementById('addEventBtn').addEventListener('click', () => {
+document.getElementById('addEventBtn').addEventListener('click', async () => {
   const input = document.getElementById('newEventInput');
   const name = input.value.trim();
   if (!name) return;
   if (data.events.includes(name)) return alert('Event already exists.');
-  data.events.push(name);
-  saveData(data);
+  const next = { ...data, events: [...data.events, name] };
   input.value = '';
-  populateSelects();
-  renderSettings();
+  await saveData(next);
 });
 
-// Export
 document.getElementById('exportBtn').addEventListener('click', () => {
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -895,7 +919,6 @@ document.getElementById('exportBtn').addEventListener('click', () => {
   URL.revokeObjectURL(url);
 });
 
-// ── Share Logic ──
 function buildShareText(runner, event, totalMs, lapsArr) {
   let text = `${runner} - ${event}\nTime: ${formatTime(totalMs)}`;
   if (lapsArr && lapsArr.length > 0) {
@@ -918,7 +941,6 @@ function shareResult(runner, event, totalMs, lapsArr) {
   }
 }
 
-// ── Keep screen awake during timing ──
 let wakeLock = null;
 async function requestWakeLock() {
   try {
@@ -940,7 +962,68 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-// ── Service Worker Registration ──
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch(() => {});
 }
+
+// ── Auth UI ──
+const authGate = document.getElementById('authGate');
+const appShell = document.querySelector('.app');
+const signInBtn = document.getElementById('signInBtn');
+const authErrorEl = document.getElementById('authError');
+
+function showAuthError(msg) {
+  if (authErrorEl) authErrorEl.textContent = msg || '';
+}
+
+function setAuthVisible(user) {
+  if (user) {
+    authGate.style.display = 'none';
+    appShell.style.display = 'flex';
+  } else {
+    authGate.style.display = 'flex';
+    appShell.style.display = 'none';
+  }
+}
+
+async function doSignIn() {
+  showAuthError('');
+  const provider = new GoogleAuthProvider();
+  try {
+    await signInWithPopup(auth, provider);
+  } catch (e) {
+    if (e.code === 'auth/popup-blocked' || e.code === 'auth/popup-closed-by-user' || e.code === 'auth/cancelled-popup-request') {
+      try { await signInWithRedirect(auth, provider); } catch (e2) { showAuthError(e2.message || 'Sign-in failed'); }
+      return;
+    }
+    showAuthError(e.message || 'Sign-in failed');
+  }
+}
+
+async function doSignOut() {
+  try { await signOut(auth); } catch {}
+}
+
+if (signInBtn) signInBtn.addEventListener('click', doSignIn);
+
+getRedirectResult(auth).catch((e) => showAuthError(e.message || ''));
+
+onAuthStateChanged(auth, (user) => {
+  currentUser = user;
+  setAuthVisible(user);
+  if (user) {
+    initialSyncDone = false;
+    subscribeToData();
+    flushPendingRaces();
+  } else {
+    unsubscribeFromData();
+    data = { ...DEFAULT_DATA, races: [] };
+    populateSelects();
+  }
+});
+
+// Initial paint before auth resolves: defaults are fine
+populateSelects();
+loadTargetForCurrentEvent();
+updateProgress();
+renderLaps();

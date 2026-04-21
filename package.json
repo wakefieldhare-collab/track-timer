@@ -1,11 +1,13 @@
 {
   "name": "track-timer",
-  "version": "1.0.0",
+  "version": "3.0.0",
+  "description": "Track Timer PWA. Client-side only, Firebase Auth + Firestore backend. Hosted on GitHub Pages.",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "migrate": "node tools/migrate.js",
+    "deploy:rules": "firebase deploy --only firestore:rules --project hare-family-apps"
   },
-  "dependencies": {
-    "express": "^4.21.0"
+  "devDependencies": {
+    "@google-cloud/firestore": "^7.10.0"
   }
 }

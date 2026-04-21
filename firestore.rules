@@ -1,0 +1,25 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isFamily() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && request.auth.token.email in [
+          'wakefield.hare@gmail.com',
+          'sara.e.hare@gmail.com',
+          'billieannhare@gmail.com',
+          'hannerhare@gmail.com',
+          'jonniehare@gmail.com'
+        ];
+    }
+
+    match /trackTimer/{docId} {
+      allow read, write: if isFamily();
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

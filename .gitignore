@@ -1,2 +1,7 @@
 node_modules/
+backups/
 data.json
+firebase-debug.log
+firestore-debug.log
+.DS_Store
+.claude/

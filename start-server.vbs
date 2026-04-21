@@ -1,2 +1,0 @@
-Set shell = CreateObject("WScript.Shell")
-shell.Run "node C:\Users\wakef\Documents\AI-Projects\track-timer\server.js", 0, False
